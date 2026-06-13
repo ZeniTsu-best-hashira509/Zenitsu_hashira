@@ -1,4 +1,3 @@
-const ytdl = require('ytdl-core');
 global.startTime = Date.now();
 global.sessions = new Map();
 
@@ -28,7 +27,7 @@ const path = require('path');
 
 // ==================== CONFIGURATION ====================
 const CONFIG = {
-    SESSION_DIR: '50935948231',
+    SESSION_DIR: 'session1',
     COMMANDS_DIR: './commands',
     RECONNECT_DELAY: 3000,
     MAX_RECONNECT_ATTEMPTS: 10,
