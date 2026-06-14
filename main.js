@@ -737,3 +737,4 @@ module.exports = {
   safeSendMessage,
   connectSubBot,
   disconnectSubBot,
+}
