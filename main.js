@@ -728,6 +728,79 @@ process.on('unhandledRejection', (e) => err(`unhandledRejection : ${e}`));
   setTimeout(() => restoreSubBots(mainSock), 15000);
 })();
 
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>ZENITSU BOT</title>
+            <meta http-equiv="refresh" content="300">
+            <style>
+                body {
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    font-family: Arial;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    height: 100vh;
+                    margin: 0;
+                }
+                .container {
+                    text-align: center;
+                    background: rgba(0,0,0,0.5);
+                    padding: 40px;
+                    border-radius: 20px;
+                }
+                .status {
+                    color: #4ade80;
+                    font-size: 20px;
+                    margin-top: 20px;
+                }
+                .stats {
+                    margin-top: 20px;
+                    font-size: 14px;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🤖 ZENITSU BOT</h1>
+                <div class="status">🟢 BOT ACTIF 24/7</div>
+                <div class="stats">
+                    📊 Uptime: ${process.uptime().toFixed(0)}s<br>
+                    🤖 Sous-bots: ${subBots?.size || 0}/${CONFIG.subBotsLimit}<br>
+                    ⏰ ${new Date().toLocaleString()}
+                </div>
+            </div>
+        </body>
+        </html>
+    `);
+});
+
+app.get('/ping', (req, res) => {
+    res.json({
+        status: 'active',
+        uptime: process.uptime(),
+        subBots: subBots?.size || 0,
+        timestamp: new Date().toISOString()
+    });
+});
+
+app.listen(PORT, () => {
+    info(`🌐 Serveur HTTP démarré sur le port ${PORT}`);
+    info(`📊 Page de monitoring: https://votre-render-url.onrender.com`);
+});
+
+// Ping automatique toutes les 10 minutes pour garder le bot actif
+setInterval(() => {
+    fetch(`http://localhost:${PORT}/ping`).catch(() => {});
+}, 10 * 60 * 1000);
+
 module.exports = {
   commands,
   eventHandlers,
