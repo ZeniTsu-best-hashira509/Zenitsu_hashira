@@ -1,343 +1,453 @@
-global.startTime = Date.now();
-global.sessions = new Map();
+'use strict';
 
-// ==================== GESTION AVANCÃ‰E DES ERREURS ====================
-process.on('uncaughtException', (err) => {
-    console.error('ðŸ’¥ ERREUR NON CAPTURÃ‰E:', err.stack || err);
-});
+// ╔══════════════════════════════════════════════════════════════╗
+// ║              ZENITSU MINI — main.js (CommonJS)              ║
+// ║         Connexion par pair code · Baileys · Termux          ║
+// ╚══════════════════════════════════════════════════════════════╝
 
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('âš ï¸ PROMISE NON GÃ‰RÃ‰E:', reason);
-});
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  isJidBroadcast,
+  isJidGroup,
+  proto,
+  getContentType,
+} = require('@whiskeysockets/baileys');
 
-process.on('warning', (warning) => {
-    console.warn('âš ï¸ WARNING:', warning.message);
-});
+const { Boom }   = require('@hapi/boom');
+const pino       = require('pino');
+const fs         = require('fs');
+const path       = require('path');
+const readline   = require('readline');
 
-process.on('SIGINT', () => {
-    console.log('ðŸ›‘ ArrÃªt propre du bot...');
-    process.exit(0);
-});
-
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
-const P = require('pino');
-const qrcode = require('qrcode-terminal');
-const fs = require('fs');
-const path = require('path');
-
-// ==================== CONFIGURATION ====================
+// ──────────────────────────────────────────────
+//  CONFIG
+// ──────────────────────────────────────────────
 const CONFIG = {
-    SESSION_DIR: 'session1',
-    COMMANDS_DIR: './commands',
-    RECONNECT_DELAY: 3000,
-    MAX_RECONNECT_ATTEMPTS: 10,
-    OWNER_JID: '50935948231@s.whatsapp.net',
-    PREFIX: '+'
+  ownerNumber : '50935948231',          // numéro pour le pair code
+  prefix      : '.',                    // préfixe des commandes
+  sessionDir  : './session',            // dossier de session
+  commandsDir : './commands',           // dossier des commandes
+  eventsDir   : './events',             // dossier des events
+  maxRetries  : 5,                      // reconnexions max
+  keepAliveMs : 5 * 60 * 1000,         // keepalive toutes les 5 min (ms)
+  botName     : 'Firefox',
 };
 
-let reconnectAttempts = 0;
-
-// ==================== FONCTIONS UTILITAIRES ====================
-const safeRequire = (modulePath) => {
-    try {
-        // âœ… RÃ©soudre le chemin absolu
-        const absolutePath = path.resolve(process.cwd(), modulePath);
-        
-        // âœ… Supprimer du cache si existe
-        if (require.cache[require.resolve(absolutePath)]) {
-            delete require.cache[require.resolve(absolutePath)];
-        }
-        
-        return require(absolutePath);
-    } catch (err) {
-        console.error(`âŒ Erreur chargement module ${modulePath}:`, err.message);
-        return null;
-    }
+// ──────────────────────────────────────────────
+//  STATS GLOBALES
+// ──────────────────────────────────────────────
+const stats = {
+  startTime      : Date.now(),
+  messagesTotal  : 0,
+  commandsUsed   : 0,
+  eventsHandled  : 0,
+  reconnections  : 0,
 };
 
-const safeSendMessage = async (sock, jid, content, options = {}) => {
-    try {
-        return await sock.sendMessage(jid, content, options);
-    } catch (err) {
-        console.error(`âŒ Erreur envoi message vers ${jid}:`, err.message);
-        return null;
-    }
-};
+// ──────────────────────────────────────────────
+//  LOGGER minimal (pino quiet)
+// ──────────────────────────────────────────────
+const logger = pino({ level: 'silent' });
 
-// ==================== GESTIONNAIRE DE COMMANDES ====================
-class CommandHandler {
-    constructor() {
-        this.commands = new Map();
-        this.replyHandlers = new Map();
-    }
+// ──────────────────────────────────────────────
+//  UTILITAIRES CONSOLE
+// ──────────────────────────────────────────────
+const now  = () => new Date().toLocaleTimeString('fr-FR');
+const log  = (tag, msg) => console.log(`\x1b[36m[${now()}]\x1b[0m \x1b[33m[${tag}]\x1b[0m ${msg}`);
+const info = (msg)      => console.log(`\x1b[36m[${now()}]\x1b[0m \x1b[32m[INFO]\x1b[0m  ${msg}`);
+const warn = (msg)      => console.log(`\x1b[36m[${now()}]\x1b[0m \x1b[33m[WARN]\x1b[0m  ${msg}`);
+const err  = (msg)      => console.log(`\x1b[36m[${now()}]\x1b[0m \x1b[31m[ERR]\x1b[0m   ${msg}`);
 
-    loadCommands(commandsDir) {
-        // âœ… RÃ©soudre le chemin absolu du dossier commands
-        const absoluteCommandsDir = path.resolve(process.cwd(), commandsDir);
-        
-        if (!fs.existsSync(absoluteCommandsDir)) {
-            console.warn(`âš ï¸ Dossier ${absoluteCommandsDir} inexistant, crÃ©ation...`);
-            fs.mkdirSync(absoluteCommandsDir, { recursive: true });
-            return;
-        }
-
-        const files = fs.readdirSync(absoluteCommandsDir).filter(f => f.endsWith('.js'));
-        
-        for (const file of files) {
-            // âœ… Utiliser le chemin absolu complet
-            const fullPath = path.join(absoluteCommandsDir, file);
-            const command = safeRequire(fullPath);
-            
-            if (!command) continue;
-
-            if (command.name && typeof command.execute === 'function') {
-                this.commands.set(command.name.toLowerCase(), command);
-                console.log(`âœ… Commande chargÃ©e: ${command.name}`);
-            }
-
-            if (typeof command.onReply === 'function') {
-                this.replyHandlers.set(file, command.onReply);
-            }
-        }
-    }
-
-    async executeCommand(sock, msg, commandName, args) {
-        const command = this.commands.get(commandName.toLowerCase());
-        if (!command) return false;
-
-        try {
-            await command.execute(sock, msg, args);
-            return true;
-        } catch (err) {
-            console.error(`âŒ Erreur exÃ©cution ${commandName}:`, err);
-            await safeSendMessage(sock, msg.key.remoteJid, {
-                text: `âŒ Erreur: ${err.message}`
-            }, { quoted: msg });
-            return false;
-        }
-    }
-
-    async processReplies(sock, msg) {
-        for (const handler of this.replyHandlers.values()) {
-            try {
-                const handled = await handler(sock, msg);
-                if (handled) return true;
-            } catch (err) {
-                console.error('âŒ Erreur onReply:', err);
-            }
-        }
-        return false;
-    }
+// ──────────────────────────────────────────────
+//  UPTIME formaté
+// ──────────────────────────────────────────────
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  const d = Math.floor(h / 24);
+  return `${d}j ${h % 24}h ${m % 60}m ${s % 60}s`;
 }
 
-// ==================== BOT PRINCIPAL ====================
-class ZenitsuBot {
-    constructor() {
-        this.sock = null;
-        this.commandHandler = new CommandHandler();
-        this.isConnected = false;
-        this.reconnectTimer = null;
+// ──────────────────────────────────────────────
+//  CHARGEUR DE COMMANDES
+// ──────────────────────────────────────────────
+const commands = new Map();
+
+function loadCommands() {
+  const dir = path.resolve(CONFIG.commandsDir);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+    warn(`Dossier ${CONFIG.commandsDir} créé (vide).`);
+    return;
+  }
+
+  // Vider le cache require pour les recharges à chaud
+  for (const [name] of commands) {
+    const filePath = path.join(dir, `${name}.js`);
+    if (require.cache[require.resolve(filePath)]) {
+      delete require.cache[require.resolve(filePath)];
     }
+  }
+  commands.clear();
 
-    async start() {
-        try {
-            // Auth
-            const { state, saveCreds } = await useMultiFileAuthState(CONFIG.SESSION_DIR);
-            const { version } = await fetchLatestBaileysVersion();
-
-            // Socket avec options robustes
-            this.sock = makeWASocket({
-                version,
-                auth: {
-                    creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(state.keys, P({ level: 'silent' }))
-                },
-                logger: P({ level: 'silent' }),
-                browser: ['Mac OS', 'Firefox', '1.0.0'],
-                connectTimeoutMs: 60000,
-                defaultQueryTimeoutMs: 60000,
-                markOnlineOnConnect: true,
-                syncFullHistory: false
-            });
-
-            // Ã‰vÃ©nements
-            this.setupConnectionHandler(saveCreds);
-            this.setupMessageHandler();
-            this.loadEvents();
-
-            // âœ… Charger commandes AVANT la connexion
-            console.log('ðŸ“‚ Chargement des commandes...');
-            this.commandHandler.loadCommands(CONFIG.COMMANDS_DIR);
-            console.log(`ðŸ“Š Total commandes chargÃ©es: ${this.commandHandler.commands.size}`);
-
-        } catch (err) {
-            console.error('ðŸ’¥ Erreur dÃ©marrage:', err);
-            this.scheduleReconnect();
-        }
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.js'));
+  for (const file of files) {
+    try {
+      const mod = require(path.join(dir, file));
+      // Support { name, execute } ou module.exports = { name, execute }
+      if (mod && mod.name && typeof mod.execute === 'function') {
+        commands.set(mod.name.toLowerCase(), mod);
+        log('CMD', `Chargé : .${mod.name}`);
+      } else {
+        warn(`commands/${file} : export invalide (name + execute requis).`);
+      }
+    } catch (e) {
+      err(`commands/${file} : ${e.message}`);
     }
-
-    setupConnectionHandler(saveCreds) {
-        this.sock.ev.on('connection.update', async (update) => {
-            const { connection, qr, lastDisconnect } = update;
-
-            if (qr) {
-                console.log('ðŸ“· Scan QR:');
-                qrcode.generate(qr, { small: true });
-            }
-
-            if (connection === 'open') {
-                this.isConnected = true;
-                reconnectAttempts = 0;
-                console.log('âœ… Bot connectÃ© !');
-                await this.sendOwnerNotification();
-            }
-
-            if (connection === 'close') {
-                this.isConnected = false;
-                console.log('âŒ DÃ©connectÃ©');
-                
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const shouldReconnect = statusCode !== 401;
-                
-                if (shouldReconnect) {
-                    this.scheduleReconnect();
-                } else {
-                    console.error('ðŸ”’ Session invalide, suppression nÃ©cessaire');
-                    process.exit(1);
-                }
-            }
-        });
-
-        this.sock.ev.on('creds.update', saveCreds);
-    }
-
-    setupMessageHandler() {
-        this.sock.ev.on('messages.upsert', async (m) => {
-            try {
-                const msg = m.messages[0];
-                if (!msg.message) return;
-
-                const from = msg.key.remoteJid;
-                const body = this.extractMessageBody(msg);
-                const sender = msg.key.participant || from;
-
-                console.log(`ðŸ“¨ [${sender.split('@')[0]}] ${body.substring(0)}`);
-
-                // Traiter les rÃ©ponses en attente
-                const replyHandled = await this.commandHandler.processReplies(this.sock, msg);
-                if (replyHandled) return;
-
-                // Traiter les commandes
-                if (body.startsWith(CONFIG.PREFIX)) {
-                    const args = body.slice(1).trim().split(/ +/);
-                    const commandName = args.shift().toLowerCase();
-                    
-                    const executed = await this.commandHandler.executeCommand(this.sock, msg, commandName, args);
-                    if (!executed) {
-                        // Optionnel: rÃ©pondre commande inconnue
-                           await safeSendMessage(this.sock, from, {
-                               text: ` *${CONFIG.PREFIX}${commandName}* inconnue`
-                           });
-                    }
-                }
-
-            } catch (err) {
-                console.error('âŒ Erreur message:', err);
-            }
-        });
-    }
-
-    loadEvents() {
-        const eventsDir = path.resolve(process.cwd(), './events');
-        if (!fs.existsSync(eventsDir)) {
-            console.warn(`âš ï¸ Dossier ${eventsDir} inexistant`);
-            return;
-        }
-
-        const files = fs.readdirSync(eventsDir).filter(f => f.endsWith('.js'));
-        for (const file of files) {
-            const fullPath = path.join(eventsDir, file);
-            const event = safeRequire(fullPath);
-            
-            if (typeof event === 'function') {
-                try {
-                    event(this.sock);
-                    console.log(`âœ… Ã‰vÃ©nement chargÃ©: ${file}`);
-                } catch (err) {
-                    console.error(`âŒ Erreur Ã©vÃ©nement ${file}:`, err);
-                }
-            }
-        }
-    }
-
-    extractMessageBody(msg) {
-        return msg.message.conversation ||
-               msg.message.extendedTextMessage?.text ||
-               msg.message.imageMessage?.caption ||
-               msg.message.videoMessage?.caption ||
-               '';
-    }
-
-    async sendOwnerNotification() {
-        setTimeout(async () => {
-            await safeSendMessage(this.sock, CONFIG.OWNER_JID, {
-                image: { url: 'https://files.catbox.moe/uklx8n.jpg' },
-                caption: ` *ZENITSU BOT CONNECTÉ*\n ONLINE\n  ${new Date().toLocaleTimeString()}\n ${this.commandHandler.commands.size} commandes \nPrefix = ${CONFIG.PREFIX} `,
-                contextInfo: { 
-                    mentionedJid: [CONFIG.OWNER_JID], 
-                    forwardingScore: 350, 
-                    isForwarded: true,
-                    forwardedNewsletterMessageInfo: {
-                      newsletterJid: '120363425394543602@newsletter',
-                      newsletterName: 'ëª¨ðŸ…’ðŸ…¨ðŸ…‘ðŸ…”ðŸ…¡ðŸ…ðŸ…žðŸ…¥ðŸ… ðŸŒŸ',
-                      serverMessageId :195
-                    }
-                }
-            });
-        }, 2000);
-    }
-
-    scheduleReconnect() {
-        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-        
-        if (reconnectAttempts < CONFIG.MAX_RECONNECT_ATTEMPTS) {
-            reconnectAttempts++;
-            const delay = CONFIG.RECONNECT_DELAY * Math.min(reconnectAttempts, 5);
-            console.log(`Reconnexion ${reconnectAttempts}/${CONFIG.MAX_RECONNECT_ATTEMPTS} dans ${delay}ms...`);
-            
-            this.reconnectTimer = setTimeout(() => {
-                this.start().catch(err => {
-                    console.error('Echec reconnexion:', err);
-                    this.scheduleReconnect();
-                });
-            }, delay);
-        } else {
-            console.error('Trop de tentatives ARRET');
-            process.exit(1);
-        }
-    }
+  }
+  info(`${commands.size} commande(s) chargée(s).`);
 }
 
-// ==================== DÃ‰MARRAGE ====================
-const bot = new ZenitsuBot();
+// ──────────────────────────────────────────────
+//  CHARGEUR D'EVENTS
+// ──────────────────────────────────────────────
+const eventHandlers = new Map();
 
-bot.start().catch(err => {
-    console.error(' Error : ', err);
-    process.exit(1);
-});
+function loadEvents() {
+  const dir = path.resolve(CONFIG.eventsDir);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+    warn(`Dossier ${CONFIG.eventsDir} créé (vide).`);
+    return;
+  }
 
-// ==================== ANTI-CRASH ULTIME ====================
-process.on('uncaughtException', (err) => {
-    console.error(' UNCAUGHT EXCEPTION:', err.stack || err);
-});
+  eventHandlers.clear();
 
-process.on('unhandledRejection', (reason) => {
-    console.error(' UNHANDLED REJECTION:', reason);
-});
-
-// Garder le processus en vie
-setInterval(() => {
-    if (bot.isConnected) {
-        console.log(' Bot actif -', new Date().toLocaleTimeString());
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.js'));
+  for (const file of files) {
+    try {
+      const mod = require(path.join(dir, file));
+      if (mod && mod.event && typeof mod.execute === 'function') {
+        if (!eventHandlers.has(mod.event)) eventHandlers.set(mod.event, []);
+        eventHandlers.get(mod.event).push(mod);
+        log('EVT', `Chargé : ${mod.event} (${file})`);
+      } else {
+        warn(`events/${file} : export invalide (event + execute requis).`);
+      }
+    } catch (e) {
+      err(`events/${file} : ${e.message}`);
     }
-}, 300000);
+  }
+  info(`${eventHandlers.size} type(s) d'événement(s) chargé(s).`);
+}
+
+// ──────────────────────────────────────────────
+//  EXTRACTION DU TEXTE D'UN MESSAGE
+// ──────────────────────────────────────────────
+function extractText(msg) {
+  const type = getContentType(msg.message);
+  if (!type) return '';
+  const content = msg.message[type];
+  if (typeof content === 'string') return content;
+  if (content?.text)    return content.text;
+  if (content?.caption) return content.caption;
+  if (content?.conversation) return content.conversation;
+  return '';
+}
+
+// ──────────────────────────────────────────────
+//  GESTION DES COMMANDES UNIVERSELLES (sans prefix)
+// ──────────────────────────────────────────────
+async function handleUniversal(sock, msg, text, jid) {
+  const lower = text.trim().toLowerCase();
+
+  // ── stat ──────────────────────────────────────
+  if (lower === 'stat') {
+    const up = formatUptime(Date.now() - stats.startTime);
+    const reply =
+      `╔═══════════════════════╗\n` +
+      `║   📊 *${CONFIG.botName}*   ║\n` +
+      `╚═══════════════════════╝\n` +
+      `⏱ *Uptime*       : ${up}\n` +
+      `💬 *Messages*    : ${stats.messagesTotal}\n` +
+      `⚡ *Commandes*   : ${stats.commandsUsed}\n` +
+      `🎯 *Événements*  : ${stats.eventsHandled}\n` +
+      `🔄 *Reconnexions*: ${stats.reconnections}`;
+    await sock.sendMessage(jid, { text: reply }, { quoted: msg });
+    return true;
+  }
+
+  // ── alive ─────────────────────────────────────
+  if (lower === 'alive') {
+    await sock.sendMessage(jid, { react: { text: '⚡', key: msg.key } });
+    return true;
+  }
+
+  return false;
+}
+
+// ──────────────────────────────────────────────
+//  DISPATCH DES EVENTS PERSONNALISÉS
+// ──────────────────────────────────────────────
+async function dispatchEvent(eventName, sock, ...args) {
+  stats.eventsHandled++;
+  const handlers = eventHandlers.get(eventName) || [];
+  for (const h of handlers) {
+    try {
+      await h.execute(sock, ...args);
+    } catch (e) {
+      err(`Event handler [${eventName}] : ${e.message}`);
+    }
+  }
+}
+
+// ──────────────────────────────────────────────
+//  DEMANDE DU PAIR CODE
+//  ⚠️  Doit être appelé APRÈS que le WS soit
+//      établi (depuis connection.update 'open'
+//      ou avec un délai post-makeWASocket).
+// ──────────────────────────────────────────────
+let pairCodeRequested = false;
+
+async function requestPairCode(sock) {
+  if (pairCodeRequested) return;
+  pairCodeRequested = true;
+
+  const number = CONFIG.ownerNumber.replace(/[^0-9]/g, '');
+
+  // Attendre que le socket soit réellement prêt (le WS met ~1-2s à s'ouvrir)
+  await new Promise(r => setTimeout(r, 5000));
+
+  try {
+    const code = await sock.requestPairingCode(number);
+    const formatted = code.match(/.{1,4}/g).join('-'); // XXXX-XXXX
+    console.log('\n');
+    console.log('  \x1b[42m\x1b[30m  VOTRE CODE DE JUMELAGE  \x1b[0m');
+    console.log(`  \x1b[1m\x1b[33m  ${formatted}  \x1b[0m`);
+    console.log('  Entrez ce code dans WhatsApp → Appareils liés → Lier avec un numéro\n');
+  } catch (e) {
+    err(`Impossible d'obtenir le pair code : ${e.message}`);
+    pairCodeRequested = false; // permettre un retry
+  }
+}
+
+// ──────────────────────────────────────────────
+//  KEEPALIVE — affichage console toutes les 5 min
+// ──────────────────────────────────────────────
+let keepAliveTimer = null;
+function startKeepAlive(sock) {
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
+  keepAliveTimer = setInterval(async () => {
+    const up = formatUptime(Date.now() - stats.startTime);
+    info(`⚡ KeepAlive — uptime: ${up} | msgs: ${stats.messagesTotal} | cmds: ${stats.commandsUsed}`);
+    // Ping léger pour maintenir la connexion ouverte
+    try { await sock.sendPresenceUpdate('available'); } catch (_) {}
+  }, CONFIG.keepAliveMs);
+}
+
+// ──────────────────────────────────────────────
+//  CONNEXION PRINCIPALE
+// ──────────────────────────────────────────────
+let retryCount = 0;
+
+async function connect() {
+  // Assurer les dossiers
+  if (!fs.existsSync(CONFIG.sessionDir)) fs.mkdirSync(CONFIG.sessionDir, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(CONFIG.sessionDir);
+  const { version }          = await fetchLatestBaileysVersion();
+
+  info(`Baileys version : ${version.join('.')}`);
+
+  const sock = makeWASocket({
+    version,
+    logger,
+    auth: {
+      creds : state.creds,
+      keys  : makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    printQRInTerminal  : false,   // on utilise le pair code
+    markOnlineOnConnect: true,
+    syncFullHistory    : false,
+    browser            : ['Mac OS', 'Chrome', '1.0.0'],
+    generateHighQualityLinkPreview: false,
+  });
+
+  // ════════════════════════════════════════════
+  //  CONNECTION UPDATE
+  // ════════════════════════════════════════════
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect } = update;
+
+    // Pair code demandé dès que le WS est "connecting" (socket ouvert, pas encore auth)
+    if (connection === 'connecting' && !sock.authState.creds.registered) {
+      requestPairCode(sock); // sans await — ne bloque pas l'event loop
+    }
+
+    if (connection === 'open') {
+      retryCount = 0;
+      pairCodeRequested = false;
+      info(`✅ Connecté en tant que ${sock.user?.id}`);
+      startKeepAlive(sock);
+      await dispatchEvent('connection.open', sock);
+    }
+
+    if (connection === 'close') {
+      if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
+
+      const code   = lastDisconnect?.error ? new Boom(lastDisconnect.error)?.output?.statusCode : 0;
+      const reason = DisconnectReason;
+
+      warn(`Connexion fermée — code: ${code}`);
+
+      // Session corrompue / logout explicite → supprimer et relancer
+      // ⚠️  On ne supprime QUE si la session était déjà enregistrée
+      //     (évite la boucle infinie lors d'un 1er login avec pair code)
+      const wasRegistered = sock.authState.creds.registered;
+
+      if (code === reason.loggedOut && wasRegistered) {
+        err('Session expirée (loggedOut). Suppression et redémarrage...');
+        fs.rmSync(CONFIG.sessionDir, { recursive: true, force: true });
+        pairCodeRequested = false;
+        retryCount = 0;
+        return connect();
+      }
+
+      // Toute autre fermeture → reconnexion avec backoff
+      if (retryCount < CONFIG.maxRetries) {
+        retryCount++;
+        stats.reconnections++;
+        pairCodeRequested = false;
+        const delay = Math.min(1000 * 2 ** retryCount, 30000);
+        warn(`Reconnexion ${retryCount}/${CONFIG.maxRetries} dans ${delay / 1000}s...`);
+        setTimeout(connect, delay);
+      } else {
+        err(`Échec après ${CONFIG.maxRetries} tentatives. Arrêt.`);
+        process.exit(1);
+      }
+    }
+
+    if (connection === 'connecting') {
+      info('Connexion en cours...');
+    }
+
+    await dispatchEvent('connection.update', sock, update);
+  });
+
+  // ════════════════════════════════════════════
+  //  SAUVEGARDE DES CREDENTIALS
+  // ════════════════════════════════════════════
+  sock.ev.on('creds.update', saveCreds);
+
+  // ════════════════════════════════════════════
+  //  MESSAGES — TRAITEMENT PRINCIPAL
+  // ════════════════════════════════════════════
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    await dispatchEvent('messages.upsert', sock, { messages, type });
+
+    for (const msg of messages) {
+      if (!msg.message) continue;
+
+      stats.messagesTotal++;
+
+      const jid  = msg.key.remoteJid;
+      const text = extractText(msg).trim();
+
+      if (!text) continue;
+
+      // ── Commandes universelles (sans prefix) ──
+      try {
+        const handled = await handleUniversal(sock, msg, text, jid);
+        if (handled) { stats.commandsUsed++; continue; }
+      } catch (e) {
+        err(`Universal handler : ${e.message}`);
+        await sock.sendMessage(jid, { text: `❌ Erreur : ${e.message}` }, { quoted: msg }).catch(() => {});
+      }
+
+      // ── Commandes avec prefix ──────────────────
+      if (!text.startsWith(CONFIG.prefix)) continue;
+
+      const args    = text.slice(CONFIG.prefix.length).trim().split(/\s+/);
+      const cmdName = args.shift().toLowerCase();
+      const cmd     = commands.get(cmdName);
+
+      if (!cmd) continue;
+
+      log('CMD', `${jid} → ${CONFIG.prefix}${cmdName} [${args.join(', ')}]`);
+      stats.commandsUsed++;
+
+      try {
+        await cmd.execute({ sock, msg, args, jid, text, config: CONFIG, stats });
+      } catch (e) {
+        err(`Commande [${cmdName}] : ${e.message}`);
+        await sock.sendMessage(jid, { text: `❌ Erreur commande *${cmdName}* :\n${e.message}` }, { quoted: msg }).catch(() => {});
+      }
+    }
+  });
+
+  // ════════════════════════════════════════════
+  //  TOUS LES AUTRES ÉVÉNEMENTS WHATSAPP
+  // ════════════════════════════════════════════
+
+  // Accusés de réception & lecture
+  sock.ev.on('messages.update',          (u) => dispatchEvent('messages.update',          sock, u));
+  sock.ev.on('message-receipt.update',   (u) => dispatchEvent('message-receipt.update',   sock, u));
+  sock.ev.on('messages.delete',          (u) => dispatchEvent('messages.delete',           sock, u));
+  sock.ev.on('messages.reaction',        (u) => dispatchEvent('messages.reaction',         sock, u));
+  sock.ev.on('messages.media-update',    (u) => dispatchEvent('messages.media-update',     sock, u));
+
+  // Présence
+  sock.ev.on('presence.update',          (u) => dispatchEvent('presence.update',           sock, u));
+
+  // Groupes
+  sock.ev.on('groups.update',            (u) => dispatchEvent('groups.update',             sock, u));
+  sock.ev.on('groups.upsert',            (u) => dispatchEvent('groups.upsert',             sock, u));
+  sock.ev.on('group-participants.update',(u) => dispatchEvent('group-participants.update', sock, u));
+
+  // Contacts & chats
+  sock.ev.on('contacts.upsert',          (u) => dispatchEvent('contacts.upsert',           sock, u));
+  sock.ev.on('contacts.update',          (u) => dispatchEvent('contacts.update',            sock, u));
+  sock.ev.on('chats.upsert',             (u) => dispatchEvent('chats.upsert',               sock, u));
+  sock.ev.on('chats.update',             (u) => dispatchEvent('chats.update',               sock, u));
+  sock.ev.on('chats.delete',             (u) => dispatchEvent('chats.delete',               sock, u));
+  sock.ev.on('chats.phoneNumberShare',   (u) => dispatchEvent('chats.phoneNumberShare',     sock, u));
+
+  // Blocage
+  sock.ev.on('blocklist.update',         (u) => dispatchEvent('blocklist.update',           sock, u));
+  sock.ev.on('blocklist.set',            (u) => dispatchEvent('blocklist.set',              sock, u));
+
+  // Appels
+  sock.ev.on('call',                     (u) => dispatchEvent('call',                       sock, u));
+
+  // Labels (WhatsApp Business)
+  sock.ev.on('labels.edit',              (u) => dispatchEvent('labels.edit',                sock, u));
+  sock.ev.on('labels.association',       (u) => dispatchEvent('labels.association',         sock, u));
+
+  return sock;
+}
+
+// ──────────────────────────────────────────────
+//  GESTION DES ERREURS PROCESS GLOBALES
+// ──────────────────────────────────────────────
+process.on('uncaughtException',  (e) => err(`uncaughtException : ${e.message}\n${e.stack}`));
+process.on('unhandledRejection', (e) => err(`unhandledRejection : ${e}`));
+
+// ──────────────────────────────────────────────
+//  DÉMARRAGE
+// ──────────────────────────────────────────────
+(async () => {
+  console.log('\n  \x1b[45m\x1b[37m  ⚡ ZENITSU MINI — DÉMARRAGE  \x1b[0m\n');
+  loadCommands();
+  loadEvents();
+  await connect();
+})();
+
+// ──────────────────────────────────────────────
+//  EXPORTS (utile si utilisé comme module)
+// ──────────────────────────────────────────────
+module.exports = { commands, eventHandlers, stats, CONFIG };
